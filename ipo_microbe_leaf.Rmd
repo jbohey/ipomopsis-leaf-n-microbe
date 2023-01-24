@@ -1,0 +1,331 @@
+---
+title: "Ipomopsis microbe leaf volatile experiment"
+author: "Janelle Bohey, John Powers"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    self_contained: no
+    lib_dir: libs
+    code_folding: hide
+    toc: yes
+    toc_float: TRUE 
+editor_options: 
+  chunk_output_type: console
+---
+<style type="text/css">
+.main-container { max-width: 1000px; margin-left: 0; margin-right: auto; }
+img{ max-width:200%; height: auto; }
+td, th { padding : 6px }
+</style>
+
+```{r setup, include=FALSE}
+library(reshape2)
+library(tidyverse)
+library(lubridate)
+library(vegan)
+library(knitr)
+#install.packages("remotes")
+#remotes::install_github("jmpowers/bouquet", build_vignettes = TRUE)
+library(bouquet)
+knitr::opts_chunk$set(comment="", cache=T, warning=F, message=F, 
+                      fig.path = "plots-microbe-leaf/", dev="svglite", dev.args=list(fix_text_size=FALSE), fig.height=8, fig.width=10)
+```
+
+```{r read_scents}
+# library(googlesheets4)
+# exp1_meta <- read_sheet("1k2XJUsRyTsQEeEoZE24yTvsl7kSyf2Gg6gehs8pUvOo", sheet="metadata", guess_max=200) %>%
+#   mutate(plant = as.character(plant))
+# exp2leaf_meta <- read_sheet("1EwPMsBAxqrRtuqH4uUBtthUOZlQluQICSvNr9u87h0E", sheet="metadata", guess_max=200) %>%
+#   mutate(plant = as.character(plant))
+# gc_verdicts <- read_sheet("1X8oo7qZlo1p6MVl_CBeBe6CUTHEAcd-FWQzfHud3Qws", sheet = "2022gc220929") %>%
+#   mutate(sample2 = ifelse(is.na(sample), FileName, sample))
+# exp1_verdicts <- gc_verdicts %>% filter(sample2 %in% exp1_meta$filename)
+# exp2leaf_verdicts <- gc_verdicts %>% filter(sample2 %in% exp2leaf_meta$filename)
+# write_csv(exp1_verdicts, file = "data/exp1_verdicts.csv")
+# write_csv(exp2leaf_verdicts, file = "data/exp2leaf_verdicts.csv")
+# load("~/MyDocs/MEGA/UCI/Schiedea/Analysis/scent/rmbl/Inventory/shimadzu_data_22.rda")
+# exp1.data <- shimadzu.data.22 %>% filter(Filename %in% exp1_verdicts$FileName)
+# exp2leaf.data <- shimadzu.data.22 %>% filter(Filename %in% exp2leaf_verdicts$FileName)
+# save(exp1.data, file = "data/exp1_data.rda")
+# save(exp2leaf.data, file = "data/exp2leaf_data.rda")
+setwd("~/Desktop/ipomopsis-microbe-leaf-main")
+exp2leaf.verdicts <- read_csv("data/exp2leaf_verdicts.csv")
+load("data/exp2leaf_data.rda") #loads exp2leaf.data (Shimadzu output)
+exp2leaf.data <- exp2leaf.data %>% left_join(select(exp2leaf.verdicts, Filename = FileName, sample2)) %>% 
+  select(-Filename) %>% rename(Filename = sample2) %>%  #replace FileName with the sample2 it holds (accounts for skips)
+  droplevels()
+
+exp2leaf.all <- dcast(exp2leaf.data, Filename~Name, sum, value.var="Area")
+rownames(exp2leaf.all) <- exp2leaf.all[,1]
+exp2leaf.all[,1] <- NULL
+```
+
+# Read metadata
+
+```{r metadata}
+transplants <- read_csv("data/EXP 2 Root washing trait measurements - transplants.csv") %>% 
+  mutate(plant = as.character(plant))
+
+metadata <- read_csv("data/EXP 2 (microbes) Leaf Volatile Sampling - metadata.csv") %>% 
+  filter(filename != "#N/A") %>% 
+  mutate(plantid = paste(site, plant, sep="-"),
+         rundate = replace_na(rundate, "918a")) %>% 
+  left_join(transplants)
+rownames(metadata) <- metadata$filename
+metadata <- metadata[rownames(exp2leaf.all),] #order metadata to match order of data
+
+metadata %>% count(trt_col) %>% kable(caption = "samples")
+metadata %>% count(plantid, trt_col) %>% count(trt_col) %>% kable(caption="plants")
+metadata %>% filter(site!="AMB") %>% drop_na(trt_col) %>% count(plantid) %>% count(n) %>% kable(caption="samples per plant")
+metadata %>% count(rundate, date) %>% pivot_wider(names_from=rundate, values_from=n) %>% kable(caption="sampling date and GC run date")
+```
+
+# Filtering
+
+```{r filtering}
+metadata <- metadata %>% mutate(type= ifelse(site=="AMB", "ambient","floral")) %>% 
+  load_metadata(GCMS_metadata, date = "date", sample = "filename", group=NULL, type = "type")
+
+longdata <- load_longdata(exp2leaf.data, sample = "Filename", RT = "Ret.Time", 
+                          name = "Name", area = "Area", match = "SI", maxmatch=100)
+
+sampletable <- make_sampletable(longdata, metadata)
+
+chemtable <- make_chemtable(longdata, metadata) %>% 
+  filter_RT(2, 17) %>% 
+  filter_match(0.8) %>% 
+  filter_freq(0.1, group = TRUE) %>% 
+  filter_contaminant(cont.list = "Caprolactam") %>% 
+  filter_area(min_maximum = 1e5) %>%
+  filter_ambient_ratio(sampletable, metadata, ratio = 3) %>% 
+  filter_ambient_ttest(sampletable, metadata, 
+                       alpha = 0.05, adjust = "fdr") 
+
+chemtable$filter_final <- with(chemtable, filter_RT == "OK" & filter_match =="OK" & 
+                                 filter_freq.floral == "OK" & filter_area == "OK" & 
+                              (filter_ambient_ratio == "OK" | (filter_ambient_ttest == "OK" & ambient_ratio >3)) &
+                                filter_contaminant == "OK")
+
+plot_filters(chemtable, option="rarity")
+plot_filters(chemtable, option="ambient")
+plot_filters(chemtable, option="prop")
+
+
+vol <- prune_sampletable(sampletable, chemtable, metadata)
+files_exclude <- rownames(vol)[rowSums(vol)==0] #files with no filtered peaks
+vol <- vol[!(rownames(vol) %in% files_exclude) ,]
+meta <- metadata[metadata$type == "floral" & !(metadata$sample %in% files_exclude),] %>% droplevels()
+#vol <- vol / as.numeric(meta$equil + meta$pumping)/3600 / meta$flrs #0.5 hr of equilibration plus 0.25 hr pumping, one flower
+```
+
+```{r heatmap, dev='png', dev.args=list()}
+library(pheatmap)
+library(dendsort)
+library(viridis)
+ph  <- pheatmap(as.matrix(t(vol))^(1/3), 
+         cluster_cols=T, show_colnames=F,
+         clustering_method="mcquitty", clustering_distance_rows="correlation",
+         clustering_distance_cols=vegdist(vol, method = "bray"),
+         clustering_callback = function(hc, ...){dendsort(hc, type="average")},
+         scale="none", color=inferno(512),
+         annotation_col = data.frame(meta %>% select("trt_col","date","rundate") %>% mutate(date=factor(date)), row.names=rownames(vol)),
+         fontsize = 10, border_color = NA, legend=F, annotation_legend=T, cutree_rows=6
+)
+```
+
+```{r ordination}
+(cap_treat <- vegan::capscale(sqrt(vol) ~ trt_col, data=meta))
+anova.cca(cap_treat, by="margin") # samples should be averaged by plant first
+
+nmds <- metaMDS(sqrt(vol), autotransform = F, trace=F)
+par(bg="grey40")
+plot(nmds, type="n")
+ordihull(nmds, meta$plantid, col="grey70")
+points(nmds, display="sites", col=meta$trt_col)
+text(nmds, display="species", cex=0.5, col="black")
+
+cap_dates <- vegan::capscale(sqrt(vol) ~ rundate + date, data=meta)
+anova.cca(cap_dates, by="margin")
+plot(cap_dates, type="n")
+legend("topleft", legend=unique(meta$date), pch=1:3)
+legend("topright", legend=unique(meta$rundate), fill=1:6)
+points(cap_dates, display="sites", pch=as.integer(factor(meta$date)), col=as.integer(factor(meta$rundate)))
+text(cap_dates, display="species", cex=0.5, col="white")
+```
+
+```{r Low N, all microbes}
+
+#cd<-c("white","blue","green")
+
+bluegreenwhite=meta%>%filter(trt_col %in% c("white","blue","green"))
+
+volbgw <-vol[bluegreenwhite$sample,] #sorts volatile table by color specified above
+
+  
+(capbgw <- capscale(sqrt(volbgw) ~ trt_col, data = bluegreenwhite, 
+                 distance = "bray"))
+anova(capbgw)
+
+ plot(capbgw, type="n", main="Leaf VOCS low nitrogen, all soil treatments")
+legend("topright", title="Low N, Microbes",legend=unique(bluegreenwhite$trt_col), fill=1:6)
+points(capbgw, display="sites", pch=as.integer(factor(bluegreenwhite$trt_col)), col=as.integer(factor(bluegreenwhite$trt_col)))
+text(capbgw, display="species", cex=0.5, col="blue")
+
+```
+
+```{r High vs low, ambient (green x red)}
+
+redgreenmeta=meta%>%filter(trt_col %in% c("red","green"))
+
+volredgreen<- vol[redgreenmeta$sample,]
+
+(capredgreen <- capscale(sqrt(volredgreen) ~ trt_col, data = redgreenmeta, 
+                 distance = "bray"))
+anova(capredgreen)
+
+ plot(capredgreen, type="n", main="Leaf VOCS high vs low nitrogen, ambient soil")
+legend("topright", title="N Treatment",legend=unique(redgreenmeta$trt_col), fill=1:6)
+points(capredgreen, display="sites", pch=as.integer(factor(redgreenmeta$trt_col)), col=as.integer(factor(redgreenmeta$trt_col)))
+text(capredgreen, display="species", cex=0.5, col="blue")
+
+```
+
+```{r High vs low N, Early snowmelt (yellow x blue)}
+yellowbluemeta=meta%>%filter(trt_col %in% c("yellow","blue"))
+
+volyellowblue<- vol[yellowbluemeta$sample,]
+
+(capyellowblue <- capscale(sqrt(volyellowblue) ~ trt_col, data = yellowbluemeta, 
+                 distance = "bray"))
+anova(capyellowblue)
+
+ plot(capyellowblue, type="n", main="Leaf VOCS high vs low nitrogen, early snowmelt")
+legend("topright", title="N Treatment",legend=unique(yellowbluemeta$trt_col), fill=1:6)
+points(capyellowblue, display="sites", pch=as.integer(factor(yellowbluemeta$trt_col)), col= as.integer(factor(yellowbluemeta$trt_col)))
+text(capyellowblue, display="species", cex=0.5, col="blue")
+
+```
+
+#High vs low N, sterile soil
+```{r High vs low N, sterile soil}
+pinkwhitemeta=meta%>%filter(trt_col %in% c("pink","white"))
+
+volpinkwhite<- vol[pinkwhitemeta$sample,]
+
+(cappinkwhite <- capscale(sqrt(volpinkwhite) ~ trt_col, data = pinkwhitemeta, 
+                 distance = "bray"))
+anova(cappinkwhite)
+
+ plot(cappinkwhite, type="n", main="Leaf VOCS high vs low nitrogen, Sterile Soil")
+legend("topright", title="N Treatment",legend=unique(pinkwhitemeta$trt_col), fill=1:6)
+points(cappinkwhite, display="sites", pch=as.integer(factor(pinkwhitemeta$trt_col)), col= as.integer(factor(pinkwhitemeta$trt_col)))
+text(cappinkwhite, display="species", cex=0.5, col="blue")
+```
+
+Early snowmelt vs ambient
+```{r Early snowmelt vs ambient}
+earlyxamientmeta=meta%>%filter(trt_col %in% c("yellow","blue","red", "green"))
+
+volearlyxamient<- vol[earlyxamientmeta$sample,]
+
+(capearlyxambient <- capscale(sqrt(volearlyxamient) ~ trt_col, data = earlyxamientmeta, 
+                 distance = "bray"))
+anova(capearlyxambient)
+
+ plot(capearlyxambient, type="n", main="Leaf VOCS Early vs Ambient Snowmelt")
+legend("topright", title="Treatment Color",legend=unique(earlyxamientmeta$trt_col), fill=1:6)
+points(capearlyxambient, display="sites", pch=as.integer(factor(earlyxamientmeta$trt_col)), col= as.integer(factor(earlyxamientmeta$trt_col)))
+text(capearlyxambient, display="species", cex=0.5, col="grey")
+```
+
+```{r early vs sterile}
+earlyxsterilemeta=meta%>%filter(trt_col %in% c("yellow","blue","pink", "white"))
+
+volearlyXsterile<- vol[earlyxsterilemeta$sample,]
+
+(capearlyXsterile <- capscale(sqrt(volearlyXsterile) ~ trt_col, data = earlyxsterilemeta, 
+                 distance = "bray"))
+anova(capearlyXsterile)
+
+plot(capearlyXsterile, type="n", main="Leaf VOCS Early Snowmelt vs Sterile Soil")
+ 
+  legend("topright", col= as.numeric(unique(facotr(earlyxsterilemeta$trt_col))),title="Treatment Color",legend=unique(earlyxsterilemeta$trt_col), fill=1:6)
+
+  points(capearlyXsterile, pch=as.integer(factor(earlyxsterilemeta$trt_col)), col= c("antiquewhite3","cadetblue","coral3", "black")[as.integer(factor(earlyxsterilemeta$trt_col))])
+
+  text(capearlyXsterile, display="species", cex=0.5, col="grey")
+```
+
+```{r ambient snowmelt vs sterile soil}
+ambientxsterilemeta=meta%>%filter(trt_col %in% c("red","green","pink", "white"))
+
+volambientXsterile<- vol[ambientxsterilemeta$sample,]
+
+(capambientXsterile <- capscale(sqrt(volambientXsterile) ~ trt_col, data = ambientxsterilemeta, 
+                 distance = "bray"))
+anova(capambientXsterile)
+
+ plot(capambientXsterile, type="n", main="Leaf VOCS Ambient Snowmelt vs Sterile Soil")
+legend("topright", title="Treatment Color",legend=unique(ambientxsterilemeta$trt_col), fill=1:6)
+points(capambientXsterile, display="sites", pch=as.integer(factor(ambientxsterilemeta$trt_col)), col= as.integer(factor(ambientxsterilemeta$trt_col)))
+text(capambientXsterile, display="species", cex=0.5, col="grey")
+```
+
+```{r}
+#analysis on total scent see if N or microbes effects the total amount of scent per leaf make 1 more colum thats sum of everything
+
+#N and floral VOCs; in conext of whole dissertations chapters, 
+```
+
+```{r new treatment columns --> N and microbe}
+#data player use mutate 
+
+
+meta <- meta %>%
+  mutate(trt_N= if_else(trt_col %in% c("blue","green", "white"),"low","high")) %>%
+  mutate(trt_microbe=if_else(trt_col %in% c("red", "green"), "Ambient", if_else(trt_col %in% c("blue", "yellow"), "Early Snow","Sterile")))
+
+                          
+```
+
+```{r CAP trt_N*trt_microbe }
+(capN.Microbe <- capscale(sqrt(vol) ~ trt_N*trt_microbe, data = meta, distance = "bray"))
+
+anova(capN.Microbe)
+
+#plot(capN.Microbe, type="n", main="Leaf VOCS N x Microbe")
+#legend("topright", title="N Treatment",legend=unique(meta$trt_N), fill=1:6)
+#points(capN.Microbe, display="sites", pch=as.integer(factor(meta$trt_microbe)), col= as.integer(factor(meta$trt_microbe)))
+#text(capN.Microbe, display="species", cex=0.5, col="grey")
+
+
+
+#plot with ggplot
+
+##code to extract the CAP values from the capscale model to plot them in ggplot
+x <- as.data.frame(scores(capN.Microbe, display = "sites"))
+meta$CAP1 <- x$CAP1
+meta$CAP2 <- x$CAP2
+
+##generate a plot in ggplot
+ggplot(meta, aes(x= CAP1, y= CAP2, color = trt_microbe)) + 
+  stat_ellipse(aes(fill = trt_N), geom = "polygon", alpha = 0.2) +
+  geom_point() +
+  theme_classic() + 
+  coord_cartesian(xlim=c(-5, 5), ylim=c(-5, 7)) +
+  geom_hline(yintercept = 0, linetype="dotted") + 
+  geom_vline(xintercept = 0, linetype="dotted") +
+  labs(color = "Experimental Treatment", fill = "Experimental Treatment") +
+  ggtitle("Capscale Analysis N x Microbe") +
+  theme(plot.title = element_text(hjust = 0.5))
+  ylab("CAP2") + 
+  xlab("CAP1") 
+
+#colorblind friendly palettes 
+  # The palette with grey:
+cbp1 <- c("#999999", "#E69F00", "#56B4E9", "#009E73","#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+# The palette with black:
+cbp2 <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
